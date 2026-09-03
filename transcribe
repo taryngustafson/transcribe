@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+transcribe — Turn audio or video recordings into text, locally.
+
+Point it at a media file (or a folder of them) and it writes a plain .txt
+transcript plus a timestamped .srt next to the recording. Handles anything
+ffmpeg can read: .mp4, .mov, .mkv, .m4a, .mp3, and friends.
+
+Knows a few Zoom conventions, since that is where recordings often come from,
+but nothing here is Zoom-specific.
+
+Everything runs on this machine. Nothing is uploaded, no API key is needed,
+and the source files are only ever read.
+
+Usage:
+    transcribe talk.mp4
+    transcribe "~/Documents/Zoom/2026-01-15 10.30.00 Team Meeting"
+    transcribe recording.mov -o ~/Desktop/transcripts
+    transcribe lecture.mp4 --name "Lecture 3"
+    transcribe ~/Documents/Zoom/2026-01-* --dry-run
+
+Requires: ffmpeg + ffprobe (brew install ffmpeg) and uv (for uvx).
+"""
+
+import argparse
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION = "1.2.0"
+
+DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm"}
+MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
+
+VALID_FORMATS = ["txt", "srt", "vtt", "tsv", "json"]
+DEFAULT_FORMATS = ["txt", "srt"]
+
+# Whisper's verbose output looks like:  [00:12.340 --> 00:15.900]  some words
+# We read the END timestamp to show real progress against the known duration.
+END_TS_RE = re.compile(r"-->\s*(?:(\d+):)?(\d{2}):(\d{2})\.(\d{3})\s*\]")
+
+
+# ---------------------------------------------------------------- utilities
+
+def die(msg, code=1):
+    print(f"transcribe: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"  ! {msg}", file=sys.stderr)
+
+
+def fmt_dur(seconds):
+    """Seconds -> 'H:MM:SS' or 'M:SS'."""
+    if seconds is None:
+        return "?"
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def check_platform():
+    """mlx-whisper is Metal-only, so say so plainly instead of failing obscurely."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        die("this needs an Apple Silicon Mac — mlx-whisper runs on Metal.\n"
+            "    On an Intel Mac, Linux or Windows, try openai-whisper or whisper.cpp.")
+
+
+def check_prereqs(need_uvx=True):
+    """Fail early and say exactly how to fix it, rather than dying mid-run."""
+    tools = [("ffmpeg", "brew install ffmpeg"),
+             ("ffprobe", "brew install ffmpeg")]
+    if need_uvx:
+        # Only a real run needs the transcriber; --dry-run just reads durations.
+        tools.append(("uvx", "curl -LsSf https://astral.sh/uv/install.sh | sh"))
+    missing = []
+    for tool, fix in tools:
+        if shutil.which(tool) is None:
+            missing.append((tool, fix))
+    if missing:
+        lines = ["missing required tools:"]
+        for tool, fix in missing:
+            lines.append(f"    {tool:8s} -> install with:  {fix}")
+        die("\n".join(lines))
+
+
+# ------------------------------------------------------------- file finding
+
+def probe(path):
+    """Return (duration_seconds, has_audio_stream, probe_succeeded)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=0",
+             str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None, False, False
+
+    if out.returncode != 0:
+        return None, False, False
+
+    duration, has_audio = None, False
+    for line in out.stdout.splitlines():
+        if line.startswith("duration="):
+            try:
+                duration = float(line.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif line.strip() == "codec_type=audio":
+            has_audio = True
+    return duration, has_audio, True
+
+
+def collect_media(paths, recursive):
+    """Expand the given paths into a sorted list of candidate media files."""
+    found, unconverted = [], []
+
+    def consider(f):
+        if f.name.startswith("."):
+            return
+        if f.suffix.lower() == ".zoom" or f.name.endswith(".tmp"):
+            # Zoom leaves these behind when a recording was never converted.
+            if f.suffix.lower() == ".zoom":
+                unconverted.append(f)
+            return
+        if f.suffix.lower() in MEDIA_EXTS:
+            found.append(f)
+
+    for raw in paths:
+        p = Path(os.path.expanduser(raw))
+        if not p.exists():
+            warn(f"no such file or folder, skipping: {p}")
+            continue
+        if p.is_file():
+            # A file named explicitly is honoured whatever its extension —
+            # ffmpeg reads more container types than the list below. Scanning a
+            # folder still filters by extension, to avoid probing every file.
+            found.append(p)
+        else:
+            it = p.rglob("*") if recursive else p.glob("*")
+            for f in sorted(it):
+                if f.is_file():
+                    consider(f)
+
+    # Deduplicate while preserving order.
+    seen, ordered = set(), []
+    for f in found:
+        r = f.resolve()
+        if r not in seen:
+            seen.add(r)
+            ordered.append(f)
+    return ordered, unconverted
+
+
+def drop_redundant_video(files):
+    """
+    Zoom writes audioNNN.m4a and videoNNN.mp4 for the same stream. The audio
+    track is identical, so transcribing the .m4a gives the same result and
+    skips an extraction step. Returns (kept, {skipped_video: audio_used}).
+    """
+    groups = {}
+    for f in files:
+        m = re.search(r"(\d{4,})$", f.stem)
+        if m:
+            groups.setdefault((f.parent, m.group(1)), []).append(f)
+
+    skipped = {}
+    for group in groups.values():
+        audios = [f for f in group if f.suffix.lower() in AUDIO_EXTS]
+        videos = [f for f in group if f.suffix.lower() in VIDEO_EXTS]
+        if audios and videos:
+            for v in videos:
+                skipped[v] = audios[0]
+
+    return [f for f in files if f not in skipped], skipped
+
+
+# -------------------------------------------------------------- transcribing
+
+def summarise_error(text):
+    """Boil a subprocess failure down to the one line worth reading."""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    errors = [ln for ln in lines if "error:" in ln.lower()]
+    msg = errors[-1] if errors else "\n".join(lines[-8:])
+    # argparse appends every valid value to an invalid-choice message.
+    msg = msg.split("(choose from")[0].rstrip()
+    return msg[:400]
+
+
+def extract_wav(src, dst):
+    """Whisper wants 16 kHz mono. ffmpeg reads the source; it never writes to it."""
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src),
+         "-vn", "-ac", "1", "-ar", "16000", str(dst)],
+        check=True,
+    )
+
+
+def run_whisper(wav, work_dir, stem, model, language, duration, show_progress):
+    """Run mlx-whisper, printing live progress against the known duration."""
+    cmd = ["uvx", "--from", "mlx-whisper", "mlx_whisper",
+           "--model", model,
+           "--output-dir", str(work_dir),
+           "--output-name", stem,
+           "--output-format", "all",
+           "--verbose", "True"]
+    if language and language.lower() != "auto":
+        cmd += ["--language", language]
+    cmd.append(str(wav))
+
+    # Whisper is a Python program writing to a pipe, so it would block-buffer
+    # its output and we would see nothing until the very end. This makes it
+    # flush each line as it goes, which is what feeds the progress display.
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+
+    is_tty = sys.stdout.isatty()
+    interval = 2 if is_tty else 30
+    start = time.time()
+    last_emit = start
+    first_segment_at = None
+    done = 0.0
+
+    def emit():
+        now = time.time()
+        decoding = (now - first_segment_at) if first_segment_at else 0.0
+        if first_segment_at is None:
+            msg = "    loading model and starting up..."
+        elif decoding < 1.0:
+            # Too early to divide by; a sub-second sample yields a nonsense rate.
+            msg = f"    {fmt_dur(done)} / {fmt_dur(duration)}   transcribing..."
+        else:
+            # Time the decode from the first segment, not from launch, so the
+            # model-loading seconds don't poison the rate and the ETA.
+            speed = done / decoding if decoding > 0 else 0
+            eta = (duration - done) / speed if (speed > 0 and duration) else None
+            pct = f"{done / duration * 100:3.0f}%" if duration else "  ?"
+            msg = (f"    {fmt_dur(done)} / {fmt_dur(duration)}  {pct}"
+                   f"   {speed:.1f}x realtime   ETA {fmt_dur(eta)}")
+        if is_tty:
+            print(f"\r{msg:<74}", end="", flush=True)
+        else:
+            print(msg, flush=True)
+
+    with tempfile.TemporaryFile(mode="w+") as errbuf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errbuf,
+                                text=True, bufsize=1, env=env)
+        for line in proc.stdout:
+            m = END_TS_RE.search(line)
+            if m:
+                h = int(m.group(1) or 0)
+                done = h * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000
+                if first_segment_at is None:
+                    first_segment_at = time.time()
+
+            # On a terminal, repaint often. When piped to a log, a line every
+            # 30s is enough to tell "working" from "stuck" at a glance.
+            if show_progress and time.time() - last_emit >= interval:
+                last_emit = time.time()
+                emit()
+
+        proc.wait()
+        if show_progress and is_tty:
+            print("\r" + " " * 76 + "\r", end="", flush=True)
+
+        if proc.returncode != 0:
+            errbuf.seek(0)
+            raise RuntimeError(summarise_error(errbuf.read())
+                               or f"mlx_whisper exited {proc.returncode}")
+
+    return time.time() - start
+
+
+def clean_name(name):
+    """Turn a user-supplied --name into a safe basename."""
+    name = name.strip()
+    if "/" in name or os.sep in name:
+        die("--name takes a filename, not a path. Use -o to choose the folder.")
+    # Typing "notes.txt" is a natural mistake; take the hint and drop the suffix.
+    suffix = Path(name).suffix.lower().lstrip(".")
+    stem = Path(name).stem if suffix in VALID_FORMATS else name
+    stem = stem.strip().strip(".")
+    if not stem:
+        die("--name cannot be empty")
+    return stem
+
+
+def unique_stem(src, used, override=None):
+    """Pick an output basename, disambiguating collisions within one run."""
+    base = override or src.stem
+    candidate = base
+    if override is None and candidate.lower() in used:
+        # Same filename from two different folders — qualify it by folder.
+        candidate = f"{src.parent.name} - {base}"
+    n = 2
+    while candidate.lower() in used:
+        candidate = f"{base} ({n})"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="transcribe",
+        description="Turn audio or video recordings into text, locally.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  transcribe talk.mp4
+  transcribe "~/Documents/Zoom/2026-01-15 10.30.00 Team Meeting"
+  transcribe screen-recording.mov -o ~/Desktop/transcripts
+  transcribe lecture.mp4 --name "Lecture 3"    # -> Lecture 3.txt
+  transcribe ~/Documents/Zoom/2026-01-*  --dry-run
+  transcribe interview.m4a -f txt          # transcript only, no .srt
+
+Output lands next to each recording unless -o is given. Existing transcripts
+are left alone unless you pass --force. Source recordings are never modified.
+""")
+    p.add_argument("paths", nargs="+", metavar="PATH",
+                   help="media file(s) and/or folder(s) of them")
+    p.add_argument("-o", "--output-dir", metavar="DIR",
+                   help="write transcripts here (default: next to each recording)")
+    p.add_argument("-N", "--name", metavar="NAME",
+                   help="name the output files (default: the recording's own name). "
+                        "With several recordings the rest get (2), (3), ...")
+    p.add_argument("-f", "--format", default=",".join(DEFAULT_FORMATS),
+                   help=f"comma-separated: {', '.join(VALID_FORMATS)} (default: txt,srt)")
+    p.add_argument("-l", "--language", default="en",
+                   help="two-letter code (en, es, fr, de, ...) or 'auto' "
+                        "to detect (default: en)")
+    p.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                   help=f"whisper model (default: {DEFAULT_MODEL})")
+    p.add_argument("-r", "--recursive", action="store_true",
+                   help="search folders recursively")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="list what would be transcribed, then stop")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite existing transcripts")
+    p.add_argument("--keep-audio", action="store_true",
+                   help="also keep the extracted 16 kHz .wav")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="suppress the live progress line")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"transcribe {VERSION}")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+
+    formats = [f.strip().lower() for f in args.format.split(",") if f.strip()]
+    bad = [f for f in formats if f not in VALID_FORMATS]
+    if bad:
+        die(f"unknown format(s): {', '.join(bad)}. Valid: {', '.join(VALID_FORMATS)}")
+    if not formats:
+        die("no output formats requested")
+
+    out_name = clean_name(args.name) if args.name else None
+
+    if not args.dry_run:
+        check_platform()
+    check_prereqs(need_uvx=not args.dry_run)
+
+    files, unconverted = collect_media(args.paths, args.recursive)
+    for z in unconverted:
+        warn(f"{z.name} is an unconverted Zoom file — open it in Zoom first")
+
+    if not files:
+        die("found no audio or video files in what you gave me")
+
+    files, skipped = drop_redundant_video(files)
+
+    out_dir = Path(os.path.expanduser(args.output_dir)) if args.output_dir else None
+    if out_dir and not args.dry_run:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            die(f"cannot create output folder {out_dir}: {e.strerror or e}")
+
+    # Probe everything up front so the plan is known before any work starts.
+    plan, used_stems = [], set()
+    for f in files:
+        duration, has_audio, ok = probe(f)
+        if not ok:
+            warn(f"ffprobe could not read this file, skipping: {f.name}")
+            continue
+        if not has_audio:
+            warn(f"no audio track, skipping: {f.name}")
+            continue
+        dest = out_dir if out_dir else f.parent
+        stem = unique_stem(f, used_stems, out_name)
+        existing = [fmt for fmt in formats if (dest / f"{stem}.{fmt}").exists()]
+        plan.append({"src": f, "duration": duration, "dest": dest,
+                     "stem": stem, "existing": existing})
+
+    if not plan:
+        die("nothing left to transcribe")
+
+    total = sum(p["duration"] or 0 for p in plan)
+    print(f"{len(plan)} recording(s), {fmt_dur(total)} of audio")
+    for v, a in skipped.items():
+        print(f"  - {v.name}: using {a.name} (same audio track)")
+
+    for p in plan:
+        note = ""
+        if p["existing"]:
+            note = "  [already done — use --force to redo]" if not args.force else "  [overwriting]"
+        renamed = f"  ->  {p['stem']}" if p["stem"] != p["src"].stem else ""
+        print(f"  - {p['src'].name}  ({fmt_dur(p['duration'])}){renamed}{note}")
+
+    if args.dry_run:
+        print("\ndry run — nothing written")
+        return
+
+    todo = [p for p in plan if args.force or not p["existing"]]
+    if not todo:
+        print("\nEverything already has a transcript. Nothing to do.")
+        return
+
+    est = sum(p["duration"] or 0 for p in todo) / 10
+    print(f"\nTranscribing {len(todo)} file(s) — roughly {fmt_dur(est)} of processing.")
+    print("Runs locally; nothing is uploaded.\n")
+
+    written, failed = [], []
+    run_start = time.time()
+
+    for i, p in enumerate(todo, 1):
+        src, stem, dest = p["src"], p["stem"], p["dest"]
+        print(f"[{i}/{len(todo)}] {src.name}  ({fmt_dur(p['duration'])})")
+
+        with tempfile.TemporaryDirectory(prefix="transcribe-") as tmp:
+            tmp = Path(tmp)
+            wav = tmp / f"{stem}.wav"
+            try:
+                print("    extracting audio...", flush=True)
+                extract_wav(src, wav)
+            except subprocess.CalledProcessError as e:
+                warn(f"could not read audio from {src.name} ({e})")
+                failed.append(src)
+                continue
+
+            try:
+                took = run_whisper(wav, tmp, stem, args.model, args.language,
+                                   p["duration"], not args.quiet)
+            except RuntimeError as e:
+                warn(f"transcription failed for {src.name}:\n{e}")
+                failed.append(src)
+                continue
+
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+                made = []
+                for fmt in formats:
+                    produced = tmp / f"{stem}.{fmt}"
+                    if produced.exists():
+                        target = dest / f"{stem}.{fmt}"
+                        shutil.copy2(produced, target)
+                        made.append(target)
+                if args.keep_audio:
+                    target = dest / f"{stem}.16k.wav"
+                    shutil.copy2(wav, target)
+                    made.append(target)
+            except OSError as e:
+                warn(f"transcribed {src.name}, but could not write to "
+                     f"{dest}: {e.strerror or e}")
+                failed.append(src)
+                continue
+
+        words = 0
+        txt = dest / f"{stem}.txt"
+        if txt.exists():
+            words = len(txt.read_text(encoding="utf-8", errors="replace").split())
+
+        speed = (p["duration"] / took) if (took and p["duration"]) else 0
+        detail = f"{words} words, " if words else ""
+        print(f"    done in {fmt_dur(took)} ({speed:.1f}x realtime) — {detail}"
+              f"wrote {', '.join(m.suffix.lstrip('.') for m in made)}")
+        written.extend(made)
+
+    print(f"\nFinished in {fmt_dur(time.time() - run_start)}.")
+    if written:
+        dests = sorted({str(m.parent) for m in written})
+        print(f"{len(written)} file(s) written to:")
+        for d in dests:
+            print(f"  {d}")
+    if failed:
+        print(f"\n{len(failed)} recording(s) failed:")
+        for f in failed:
+            print(f"  {f}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\ninterrupted — source recordings are untouched", file=sys.stderr)
+        sys.exit(130)
+    except OSError as e:
+        where = getattr(e, "filename", None)
+        die(f"{e.strerror or e}{f': {where}' if where else ''}")
