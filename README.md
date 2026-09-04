@@ -118,8 +118,9 @@ transcribe entrevista.mp4 -l es
 
 ## Zoom folders
 
-Nothing here is Zoom-specific, but Zoom is a common source, so it knows two of
-its conventions.
+This began as a Zoom-only tool, which is why Zoom gets special treatment here. It
+turned out nothing about the job was actually Zoom-specific, so it grew to take any
+recording — but the two Zoom conventions it had already learned were worth keeping.
 
 Zoom writes a pair of files per stream — `audio1234.m4a` and `video1234.mp4` —
 holding the **same audio track**. `transcribe` notices the pair and transcribes
