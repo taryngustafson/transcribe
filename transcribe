@@ -26,6 +26,7 @@ import argparse
 import os
 import platform
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
@@ -72,6 +73,38 @@ def fmt_dur(seconds):
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def model_cache_dir(model):
+    """Where huggingface_hub stores this model, or None for a local path."""
+    if "/" not in model:
+        return None
+    slug = "models--" + model.replace("/", "--")
+    hub = os.environ.get("HF_HUB_CACHE")
+    if hub:
+        return Path(hub) / slug
+    home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    return home / "hub" / slug
+
+
+def model_is_cached(model):
+    d = model_cache_dir(model)
+    return d is None or d.is_dir()
+
+
+def dir_size_mb(path):
+    """Rough size of a directory tree, in MB. Used to show download progress."""
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        return 0.0
+    return total / (1024 * 1024)
 
 
 def check_platform():
@@ -238,6 +271,7 @@ def extract_wav(src, dst):
 
 def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
                 keep_context=False):
+    """Returns (total_seconds, decode_seconds) -- decode excludes model setup."""
     """Run mlx-whisper, printing live progress against the known duration."""
     cmd = ["uvx", "--from", "mlx-whisper", "mlx_whisper",
            "--model", model,
@@ -268,11 +302,26 @@ def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
     first_segment_at = None
     done = 0.0
 
+    cache_dir = model_cache_dir(model)
+    was_cached = model_is_cached(model)
+
     def emit():
         now = time.time()
         decoding = (now - first_segment_at) if first_segment_at else 0.0
         if first_segment_at is None:
-            msg = "    loading model and starting up..."
+            # Nothing has been transcribed yet. On a first run this phase is a
+            # ~1.5 GB download, so say so rather than looking frozen.
+            waited = fmt_dur(now - start)
+            if not was_cached and cache_dir is not None:
+                # The byte count depends on where huggingface_hub stages the
+                # download, which is not guaranteed; show it only if it reads
+                # as something, rather than claiming a misleading "0 MB".
+                got = dir_size_mb(cache_dir)
+                so_far = f"{got:,.0f} MB so far, " if got >= 1 else ""
+                msg = (f"    downloading the model, one time only — "
+                       f"{so_far}{waited} elapsed")
+            else:
+                msg = f"    loading the model... ({waited})"
         elif decoding < 1.0:
             # Too early to divide by; a sub-second sample yields a nonsense rate.
             msg = f"    {fmt_dur(done)} / {fmt_dur(duration)}   transcribing..."
@@ -292,8 +341,15 @@ def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
     with tempfile.TemporaryFile(mode="w+") as errbuf:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errbuf,
                                 text=True, bufsize=1, env=env)
-        for line in proc.stdout:
-            m = END_TS_RE.search(line)
+        while True:
+            # Wait on stdout with a timeout so the progress line keeps ticking
+            # even while the child is silent -- which is the entire download.
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            line = proc.stdout.readline() if ready else ""
+            if ready and not line:
+                break
+
+            m = END_TS_RE.search(line) if line else None
             if m:
                 h = int(m.group(1) or 0)
                 done = h * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000
@@ -307,6 +363,7 @@ def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
                 emit()
 
         proc.wait()
+        setup = (first_segment_at - start) if first_segment_at else 0.0
         if show_progress and is_tty:
             print("\r" + " " * 76 + "\r", end="", flush=True)
 
@@ -315,7 +372,8 @@ def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
             raise RuntimeError(summarise_error(errbuf.read())
                                or f"mlx_whisper exited {proc.returncode}")
 
-    return time.time() - start
+    total = time.time() - start
+    return total, max(total - setup, 0.0)
 
 
 def clean_name(name):
@@ -481,6 +539,10 @@ def main():
 
     est = sum(p["duration"] or 0 for p in todo) / 10
     print(f"\nTranscribing {len(todo)} file(s) — roughly {fmt_dur(est)} of processing.")
+    if not model_is_cached(args.model):
+        print("First run: the transcription model (~1.5 GB) has to download before "
+              "any transcribing starts.")
+        print("That happens once and is cached afterwards. Expect a few minutes.")
     print("Runs locally; nothing is uploaded.\n")
 
     written, failed = [], []
@@ -502,9 +564,9 @@ def main():
                 continue
 
             try:
-                took = run_whisper(wav, tmp, stem, args.model, args.language,
-                                   p["duration"], not args.quiet,
-                                   args.keep_context)
+                took, decoded = run_whisper(wav, tmp, stem, args.model,
+                                            args.language, p["duration"],
+                                            not args.quiet, args.keep_context)
             except RuntimeError as e:
                 warn(f"transcription failed for {src.name}:\n{e}")
                 failed.append(src)
@@ -534,9 +596,20 @@ def main():
         if txt.exists():
             words = len(txt.read_text(encoding="utf-8", errors="replace").split())
 
-        speed = (p["duration"] / took) if (took and p["duration"]) else 0
+        # Normally wall-clock time is the honest number. But when a big one-time
+        # download happened first, folding it in reports a nonsense rate -- a
+        # 21-second clip came out as "0.3x realtime" on a first run -- so in that
+        # case report the download separately and rate only the transcribing.
+        setup = took - decoded
+        if setup > 5:
+            print(f"    model downloaded and loaded in {fmt_dur(setup)} (one time only)")
+            elapsed = decoded
+        else:
+            elapsed = took
+        speed = (p["duration"] / elapsed) if (elapsed and p["duration"]) else 0
         detail = f"{words} words, " if words else ""
-        print(f"    done in {fmt_dur(took)} ({speed:.1f}x realtime) — {detail}"
+        shown = "under a second" if elapsed < 1 else fmt_dur(elapsed)
+        print(f"    done in {shown} ({speed:.1f}x realtime) — {detail}"
               f"wrote {', '.join(m.suffix.lstrip('.') for m in made)}")
         written.extend(made)
 

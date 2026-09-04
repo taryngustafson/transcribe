@@ -117,9 +117,28 @@ A second review found two more, fixed in v1.2.1:
    though the script is missing. Same class as the ffmpeg finding: invisible to anyone
    whose machine is already set up.
 
-The lesson worth keeping: every one of those was invisible from inside a working
+A cold-start test -- ffmpeg, uv, the model cache and the tool all removed -- found
+three more, fixed in v1.4.0:
+
+10. **The tool looked frozen for the entire first-run download.** The progress line
+    only updated when Whisper printed a transcription segment to stdout, but the
+    download writes to stderr, which is captured to a temp file. So the longest phase
+    of a first run -- minutes, ~2 GB -- printed nothing after "extracting audio...".
+    There was even a "loading model" message meant for this, but it lived inside the
+    stdout loop, so it could never fire while stdout was silent. The read loop now
+    waits on stdout with a one-second timeout, so the heartbeat ticks regardless.
+11. **The time estimate ignored the download.** "roughly 0:02 of processing" for a run
+    that took 1:07. A first run now says the model has to download first.
+12. **The speed figure folded in the download.** A 21-second clip reported "0.3x
+    realtime" because the rate divided by total elapsed. Download and transcription
+    are now timed separately, and only reported separately when a download actually
+    happened -- folding them apart on a warm run produced its own nonsense
+    ("done in 0:00 (66.6x realtime)").
+
+The lesson worth keeping: every one of these was invisible from inside a working
 directory with the right commands already in hand. They only appeared by running from
-outside one.
+outside one -- and 10 through 12 needed the caches cold as well, which no amount of
+reading the code would have surfaced.
 
 ## Possible future features
 

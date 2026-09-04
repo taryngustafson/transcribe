@@ -177,6 +177,19 @@ Long recordings print a live line so you can tell at a glance that it's working:
     done in 1:12 (10.0x realtime) — 1800 words, wrote txt, srt
 ```
 
+On a first run, before any of that, it reports the one-time model download:
+
+```
+[1/1] interview.m4a  (12:00)
+    extracting audio...
+    downloading the model, one time only — 412 MB so far, 0:38 elapsed
+    model downloaded and loaded in 1:03 (one time only)
+    done in 1:12 (10.0x realtime) — 1800 words, wrote txt, srt
+```
+
+The download is timed separately from the transcribing, so the speed figure describes
+the transcription rather than being dragged down by a one-time download.
+
 When output is piped to a log file it prints one line every 30 seconds instead of
 repainting.
 
@@ -194,7 +207,8 @@ repainting.
   such a phrase dozens of times; `--keep-context` restores Whisper's own default if
   you want it.
 - **The first run downloads the model** (~1.5 GB), cached afterwards under
-  `~/.cache/huggingface`. Later runs start in seconds.
+  `~/.cache/huggingface`. It says so before it starts and reports progress while it
+  happens, so a slow first run doesn't look like a hang. Later runs start in seconds.
 - **Apple Silicon only**, and it says so plainly rather than failing strangely.
   On an Intel Mac, Linux or Windows, [openai-whisper](https://github.com/openai/whisper)
   or [whisper.cpp](https://github.com/ggerganov/whisper.cpp) do the same job.
