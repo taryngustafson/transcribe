@@ -4,19 +4,18 @@ Working notes for the tool itself. User-facing documentation lives in `README.md
 
 ## What it is
 
-A local CLI that turns any audio or video file into a `.txt` transcript plus a
+This is a local CLI that turns any audio or video file into a `.txt` transcript plus a
 timestamped `.srt`. Runs `mlx-whisper` on Apple Silicon through `uvx`, so nothing is
 installed permanently, nothing is uploaded, and no API key is involved.
 
 ## Where this came from
 
-It started as `zoom-transcribe`, built for exactly one job: getting the content of a
-Zoom recording without having to sit and watch it. Zoom was the whole point, and the
-name said so.
+This started as `zoom-transcribe`, built for getting the content of a
+Zoom meeting recording without having to sit and watch it. I often record educational videos or scientific presentations via recording myself on Zoom, so I wanted a way to skim through what I'd said to fact check it without having to listen to the entire recording.
 
-Two things became clear quickly. First, nothing about the job was actually
+Once I started using this tool with my zoom recordings, I realized almost none of it was actually
 Zoom-specific — the tool reads whatever ffmpeg can open, and a Zoom `.mp4` is just an
-`.mp4`. Second, the parts that *were* Zoom-specific were small, cheap, and genuinely
+`.mp4` - so I could use this for other recordings or videos as well. The parts that *were* Zoom-specific were small, cheap, and genuinely
 useful: the `audioNNN`/`videoNNN` pairing, and the warning about unconverted `.zoom`
 files. So the tool was renamed to `transcribe` and opened up to any recording, while
 the Zoom conveniences stayed.
