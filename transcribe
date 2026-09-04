@@ -33,7 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
@@ -43,6 +43,10 @@ MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
 
 VALID_FORMATS = ["txt", "srt", "vtt", "tsv", "json"]
 DEFAULT_FORMATS = ["txt", "srt"]
+
+# Zoom's own names for the two halves of one recording.
+ZOOM_AUDIO_RE = re.compile(r"^audio(\d{4,})$", re.IGNORECASE)
+ZOOM_VIDEO_RE = re.compile(r"^video(\d{4,})$", re.IGNORECASE)
 
 # Whisper's verbose output looks like:  [00:12.340 --> 00:15.900]  some words
 # We read the END timestamp to show real progress against the known duration.
@@ -167,24 +171,43 @@ def collect_media(paths, recursive):
     return ordered, unconverted
 
 
-def drop_redundant_video(files):
+def same_length(a, b, tolerance=0.5):
+    """Two halves of one recording agree on duration to within rounding."""
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tolerance
+
+
+def drop_redundant_video(files, durations):
     """
     Zoom writes audioNNN.m4a and videoNNN.mp4 for the same stream. The audio
     track is identical, so transcribing the .m4a gives the same result and
     skips an extraction step. Returns (kept, {skipped_video: audio_used}).
+
+    Two things must hold before anything is dropped: both files carry Zoom's
+    own audio/video names, and they report the same duration. Matching on a
+    trailing run of digits alone is not enough -- date-stamped recordings like
+    standup_20260101.m4a and demo_20260101.mp4 share one, and pairing those
+    would silently discard a recording the user asked to transcribe.
     """
-    groups = {}
+    audio_by_id, video_by_id = {}, {}
     for f in files:
-        m = re.search(r"(\d{4,})$", f.stem)
-        if m:
-            groups.setdefault((f.parent, m.group(1)), []).append(f)
+        ext = f.suffix.lower()
+        m = ZOOM_AUDIO_RE.match(f.stem)
+        if m and ext in AUDIO_EXTS:
+            audio_by_id.setdefault((f.parent, m.group(1)), []).append(f)
+            continue
+        m = ZOOM_VIDEO_RE.match(f.stem)
+        if m and ext in VIDEO_EXTS:
+            video_by_id.setdefault((f.parent, m.group(1)), []).append(f)
 
     skipped = {}
-    for group in groups.values():
-        audios = [f for f in group if f.suffix.lower() in AUDIO_EXTS]
-        videos = [f for f in group if f.suffix.lower() in VIDEO_EXTS]
-        if audios and videos:
-            for v in videos:
+    for key, videos in video_by_id.items():
+        audios = audio_by_id.get(key)
+        if not audios:
+            continue
+        for v in videos:
+            if same_length(durations.get(v), durations.get(audios[0])):
                 skipped[v] = audios[0]
 
     return [f for f in files if f not in skipped], skipped
@@ -386,17 +409,9 @@ def main():
     if not files:
         die("found no audio or video files in what you gave me")
 
-    files, skipped = drop_redundant_video(files)
-
-    out_dir = Path(os.path.expanduser(args.output_dir)) if args.output_dir else None
-    if out_dir and not args.dry_run:
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            die(f"cannot create output folder {out_dir}: {e.strerror or e}")
-
-    # Probe everything up front so the plan is known before any work starts.
-    plan, used_stems = [], set()
+    # Probe up front: durations drive the plan, and they also confirm that a
+    # Zoom audio/video pair really is two halves of one recording.
+    durations = {}
     for f in files:
         duration, has_audio, ok = probe(f)
         if not ok:
@@ -405,10 +420,27 @@ def main():
         if not has_audio:
             warn(f"no audio track, skipping: {f.name}")
             continue
+        durations[f] = duration
+
+    files = [f for f in files if f in durations]
+    if not files:
+        die("nothing left to transcribe")
+
+    files, skipped = drop_redundant_video(files, durations)
+
+    out_dir = Path(os.path.expanduser(args.output_dir)) if args.output_dir else None
+    if out_dir and not args.dry_run:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            die(f"cannot create output folder {out_dir}: {e.strerror or e}")
+
+    plan, used_stems = [], set()
+    for f in files:
         dest = out_dir if out_dir else f.parent
         stem = unique_stem(f, used_stems, out_name)
         existing = [fmt for fmt in formats if (dest / f"{stem}.{fmt}").exists()]
-        plan.append({"src": f, "duration": duration, "dest": dest,
+        plan.append({"src": f, "duration": durations[f], "dest": dest,
                      "stem": stem, "existing": existing})
 
     if not plan:

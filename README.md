@@ -36,10 +36,28 @@ adding it to your project's `renv` library.
 
 ```bash
 git clone https://github.com/taryngustafson/transcribe.git ~/transcribe
+mkdir -p ~/bin
 ln -s ~/transcribe/transcribe ~/bin/transcribe
 ```
 
-Make sure `~/bin` is on your `PATH`, then check it works:
+`~/bin` does not exist on a fresh macOS account, which is why `mkdir -p` is there —
+without it, `ln` fails with a "No such file or directory" that appears to blame the
+script.
+
+Then make sure `~/bin` is on your `PATH`. Check with:
+
+```bash
+echo $PATH | tr ':' '\n' | grep "$HOME/bin"
+```
+
+If that prints nothing, add it:
+
+```bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Now verify:
 
 ```bash
 transcribe --help

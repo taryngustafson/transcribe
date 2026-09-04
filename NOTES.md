@@ -71,6 +71,20 @@ issues found, all fixed in v1.2.0:
 Also added: an Apple Silicon check that explains itself, a LICENSE, and a README note
 that no Python install is needed.
 
+A second review found two more, fixed in v1.2.1:
+
+8. **Zoom pairing matched on any trailing run of 4+ digits**, so two unrelated
+   date-stamped recordings — `standup_20260101.m4a` and `demo_20260101.mp4` — were
+   treated as one pair and one of them was silently dropped, with the tool asserting
+   they shared an audio track. Pairing now requires Zoom's own `audioNNN`/`videoNNN`
+   names *and* matching durations. Real Zoom pairs agree to the microsecond, so the
+   duration check costs nothing and makes the claim verifiable rather than assumed.
+   Probing moved ahead of pairing to make the durations available.
+9. **The README's install steps never created `~/bin`.** It does not exist on a fresh
+   macOS account, so `ln` failed with a "No such file or directory" that reads as
+   though the script is missing. Same class as the ffmpeg finding: invisible to anyone
+   whose machine is already set up.
+
 The lesson worth keeping: every one of those was invisible from inside a working
 directory with the right commands already in hand. They only appeared by running from
 outside one.
