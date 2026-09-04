@@ -35,14 +35,20 @@ adding it to your project's `renv` library.
 ## Installation
 
 ```bash
-git clone https://github.com/taryngustafson/transcribe.git ~/transcribe
+git clone https://github.com/taryngustafson/transcribe.git
+cd transcribe
 mkdir -p ~/bin
-ln -s ~/transcribe/transcribe ~/bin/transcribe
+ln -s "$PWD/transcribe" ~/bin/transcribe
 ```
 
-`~/bin` does not exist on a fresh macOS account, which is why `mkdir -p` is there —
-without it, `ln` fails with a "No such file or directory" that appears to blame the
-script.
+Clone it wherever you like — `cd` into it first and `$PWD` fills in the right path.
+Two details that are easy to get wrong here:
+
+- `~/bin` does not exist on a fresh macOS account, which is why `mkdir -p` is there.
+- `ln -s` pointed at a path that doesn't exist **succeeds silently**, leaving a broken
+  link that only fails later with a confusing "no such file or directory". Using
+  `$PWD` avoids guessing at the path. If you're reinstalling and the link already
+  exists, `ln -sf` replaces it.
 
 Then make sure `~/bin` is on your `PATH`. Check with:
 
