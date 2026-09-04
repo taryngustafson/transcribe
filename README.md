@@ -117,6 +117,7 @@ transcribe entrevista.mp4 -l es
 | `-r`, `--recursive` | Search folders recursively |
 | `-n`, `--dry-run` | List what would be transcribed, then stop |
 | `--force` | Overwrite existing transcripts |
+| `--keep-context` | Let Whisper carry its previous output forward (its own default — can loop on silence) |
 | `--keep-audio` | Also keep the extracted 16 kHz `.wav` |
 | `-q`, `--quiet` | Suppress the live progress line |
 | `-h`, `--help` | Show help |
@@ -185,6 +186,13 @@ repainting.
   slides, a diagram, "as you can see here" — the text alone won't carry it.
 - **No speaker labels.** Whisper transcribes speech but doesn't separate who is
   talking. For a multi-person meeting you get the words in order, unattributed.
+- **Silence can produce invented text.** Whisper has no way to say "nothing was
+  said", so on a long silent stretch — dead air on a phone call, a recording left
+  running — it may emit a filler phrase like "Thank you." or "Bye." A few stray
+  lines at the end of a transcript with no speech behind them are this, not
+  something you said. `transcribe` turns off the setting that makes Whisper repeat
+  such a phrase dozens of times; `--keep-context` restores Whisper's own default if
+  you want it.
 - **The first run downloads the model** (~1.5 GB), cached afterwards under
   `~/.cache/huggingface`. Later runs start in seconds.
 - **Apple Silicon only**, and it says so plainly rather than failing strangely.

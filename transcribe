@@ -33,7 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
@@ -236,7 +236,8 @@ def extract_wav(src, dst):
     )
 
 
-def run_whisper(wav, work_dir, stem, model, language, duration, show_progress):
+def run_whisper(wav, work_dir, stem, model, language, duration, show_progress,
+                keep_context=False):
     """Run mlx-whisper, printing live progress against the known duration."""
     cmd = ["uvx", "--from", "mlx-whisper", "mlx_whisper",
            "--model", model,
@@ -244,6 +245,13 @@ def run_whisper(wav, work_dir, stem, model, language, duration, show_progress):
            "--output-name", stem,
            "--output-format", "all",
            "--verbose", "True"]
+    if not keep_context:
+        # Whisper feeds each segment its own previous output as context. On a
+        # stretch of silence it invents a filler phrase ("Bye.", "Thank you."),
+        # which then becomes the context that reproduces it -- one stray line
+        # becomes fifty. Turning this off costs nothing measurable on speech
+        # and stops the loop.
+        cmd += ["--condition-on-previous-text", "False"]
     if language and language.lower() != "auto":
         cmd += ["--language", language]
     cmd.append(str(wav))
@@ -377,6 +385,10 @@ are left alone unless you pass --force. Source recordings are never modified.
                    help="list what would be transcribed, then stop")
     p.add_argument("--force", action="store_true",
                    help="overwrite existing transcripts")
+    p.add_argument("--keep-context", action="store_true",
+                   help="let Whisper carry its own previous output forward as "
+                        "context. Whisper's own default, but it can loop on "
+                        "silence — see the README")
     p.add_argument("--keep-audio", action="store_true",
                    help="also keep the extracted 16 kHz .wav")
     p.add_argument("-q", "--quiet", action="store_true",
@@ -491,7 +503,8 @@ def main():
 
             try:
                 took = run_whisper(wav, tmp, stem, args.model, args.language,
-                                   p["duration"], not args.quiet)
+                                   p["duration"], not args.quiet,
+                                   args.keep_context)
             except RuntimeError as e:
                 warn(f"transcription failed for {src.name}:\n{e}")
                 failed.append(src)

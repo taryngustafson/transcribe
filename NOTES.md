@@ -50,6 +50,16 @@ than being handed the commands.
   it, Python block-buffers into a pipe and the progress line shows nothing until the
   run is already over.
 - **Sources are never written to.** Every path is read-only; output goes elsewhere.
+- **`condition_on_previous_text` is off.** This is Whisper's own default and it is a
+  trap. Whisper invents filler text on silence, and this setting feeds each segment's
+  output forward as context for the next, so a single hallucinated "Bye." becomes the
+  context that reproduces it — measured at 53 identical lines from one stray phrase on
+  a phone recording with 95 seconds of dead air (-80 dB). The subtitles ran 11 seconds
+  past the end of the audio, and every repeat was exactly 2.000 seconds long. Turning
+  it off cut that file from 62 lines to 12. The cost on real speech is nil: a
+  known-good 8-minute recording gave 1198 words against a 1197-word baseline, with an
+  identical opening. `--keep-context` restores the old behaviour for anyone who wants
+  it, and reproduces the 62-line loop exactly.
 - **Stdlib only**, so it runs on the `python3` that ships with macOS. No virtualenv,
   no `pip install`, nothing for a new user to set up beyond ffmpeg and uv.
 
